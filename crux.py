@@ -1,6 +1,7 @@
 import os
 from google import genai
 
+
 def get_crux(text):
     """
     Identifies the central argument or load-bearing claim of the article.
@@ -30,10 +31,7 @@ def get_crux(text):
     """
 
     try:
-        response = client.models.generate_content(
-            model=model_id,
-            contents=prompt
-        )
+        response = client.models.generate_content(model=model_id, contents=prompt)
         return response.text.strip()
     except Exception as e:
         return f"Error getting crux: {e}"
