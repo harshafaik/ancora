@@ -58,3 +58,5 @@ urllib3==2.6.3
 websockets==16.0
 fastapi
 uvicorn
+mmh3
+bitarray
