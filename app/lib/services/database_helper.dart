@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:path/path.dart';
-import 'package:sqflite/sqflite.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:crypto/crypto.dart';
 import 'dart:convert';
@@ -21,16 +20,31 @@ class DatabaseHelper {
   }
 
   Future<Database> _initDatabase() async {
-    // Initialize FFI for Linux/Windows/macOS desktop
+    // On desktop, use FFI factory. On Android/iOS, use native sqflite.
+    // Never overwrite the global databaseFactory — it pollutes all platforms.
     if (Platform.isLinux || Platform.isWindows) {
       sqfliteFfiInit();
-      databaseFactory = databaseFactoryFfi;
+      final dbDir = join(
+        Platform.environment['HOME'] ?? '.',
+        '.local', 'share', 'ancora',
+      );
+      await Directory(dbDir).create(recursive: true);
+      final path = join(dbDir, 'ancora.db');
+      return await databaseFactoryFfi.openDatabase(
+        path,
+        options: OpenDatabaseOptions(
+          version: 4,
+          onCreate: _onCreate,
+          onUpgrade: _onUpgrade,
+        ),
+      );
     }
 
-    String path = join(await getDatabasesPath(), 'ancora.db');
+    // Android/iOS: native sqflite
+    final path = join(await getDatabasesPath(), 'ancora.db');
     return await openDatabase(
       path,
-      version: 3,
+      version: 4,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -42,6 +56,10 @@ class DatabaseHelper {
     }
     if (oldVersion < 3) {
       await db.execute('ALTER TABLE articles ADD COLUMN concepts TEXT');
+    }
+    if (oldVersion < 4) {
+      await db.execute('ALTER TABLE articles ADD COLUMN is_bookmarked INTEGER DEFAULT 0');
+      await db.execute('ALTER TABLE articles ADD COLUMN is_read INTEGER DEFAULT 0');
     }
   }
 
@@ -69,7 +87,9 @@ class DatabaseHelper {
         crux TEXT,
         crux_model TEXT,
         extraction_status TEXT DEFAULT "ok",
-        concepts TEXT
+        concepts TEXT,
+        is_bookmarked INTEGER DEFAULT 0,
+        is_read INTEGER DEFAULT 0
       )
     ''');
 
@@ -177,11 +197,11 @@ class DatabaseHelper {
     await db.update(
       'articles',
       {
-        'crux': crux, 
+        'crux': crux,
         'crux_model': modelName,
         'concepts': concepts
       },
-      where: 'url = ? AND crux IS NULL',
+      where: 'url = ?',
       whereArgs: [url],
     );
   }
@@ -189,5 +209,57 @@ class DatabaseHelper {
   Future<void> deleteArticle(String id) async {
     Database db = await database;
     await db.delete('articles', where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// Deletes all articles and sources, then reseeds default sources.
+  Future<void> clearAllData() async {
+    Database db = await database;
+    await db.delete('articles');
+    await db.delete('sources');
+    await _onCreate(db, 4);
+  }
+
+  // ── Bookmark operations ──────────────────────────────────────────────
+
+  Future<void> toggleBookmark(String url) async {
+    Database db = await database;
+    await db.rawUpdate(
+      'UPDATE articles SET is_bookmarked = 1 - is_bookmarked WHERE url = ?',
+      [url],
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> getBookmarkedArticles() async {
+    Database db = await database;
+    return await db.query(
+      'articles',
+      where: 'is_bookmarked = 1',
+      orderBy: 'fetched_at DESC',
+    );
+  }
+
+  // ── Read status ──────────────────────────────────────────────────────
+
+  Future<void> markAsRead(String url) async {
+    Database db = await database;
+    await db.update('articles', {'is_read': 1}, where: 'url = ?', whereArgs: [url]);
+  }
+
+  Future<void> clearReadHistory() async {
+    Database db = await database;
+    await db.update('articles', {'is_read': 0});
+  }
+
+  // ── Search ───────────────────────────────────────────────────────────
+
+  Future<List<Map<String, dynamic>>> searchArticles(String query) async {
+    Database db = await database;
+    final pattern = '%$query%';
+    return await db.query(
+      'articles',
+      where: 'title LIKE ? OR crux LIKE ?',
+      whereArgs: [pattern, pattern],
+      orderBy: 'fetched_at DESC',
+    );
   }
 }
