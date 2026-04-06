@@ -39,7 +39,7 @@ class NewsService {
             'title': extracted['title'],
             'published_at': extracted['date'],
             'full_text': extracted['text'],
-            'extraction_status': extracted['status'],
+            'extraction_status': extracted['extraction_status'] ?? 'ok',
           });
           return isNew;
         }
@@ -63,8 +63,6 @@ class NewsService {
       final customCruxPrompt = prefs.getString('cruxPrompt');
 
       if (apiKey.isNotEmpty) {
-        // Cruxes are usually API bound, so we do them sequentially or in small batches 
-        // to avoid rate limits, but we can do a few at a time.
         final cruxFutures = unprocessed.map((article) async {
           final result = await _ai.getCruxAndConcepts(
             text: article['full_text'],
@@ -78,18 +76,27 @@ class NewsService {
             final crux = result['crux'];
             final concepts = jsonEncode(result['concepts'] ?? []);
             await _db.updateCrux(
-              article['url'], 
-              crux, 
+              article['url'],
+              crux,
               model.isNotEmpty ? model : provider,
-              concepts: concepts
+              concepts: concepts,
             );
             return true;
           }
+
+          // Log the error so it's visible in console
+          final error = result['error'] ?? 'Unknown error';
+          print('[CruxGen] Failed for ${article['title']}: $error');
           return false;
         });
 
         final results = await Future.wait(cruxFutures);
         newCruxesCount = results.where((success) => success).length;
+
+        final failed = results.where((s) => !s).length;
+        if (failed > 0) {
+          print('[CruxGen] $failed crux(es) failed to generate. Check API key and model.');
+        }
       }
     }
 

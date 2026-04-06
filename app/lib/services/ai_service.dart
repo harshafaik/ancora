@@ -87,7 +87,7 @@ Article Text:
           final data = jsonDecode(response.body);
           responseBody = data['choices'][0]['message']['content'].toString().trim();
         } else {
-          return {"error": "$provider API returned ${response.statusCode}"};
+          return {"error": "$provider API returned ${response.statusCode}: ${response.body}"};
         }
       }
 

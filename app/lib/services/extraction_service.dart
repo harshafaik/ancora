@@ -6,113 +6,171 @@ import 'package:html/parser.dart' as html_parser;
 import 'package:html/dom.dart' as dom;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
+/// Extracts readable text from a news article URL.
+///
+/// Pipeline:
+///   1. Plain HTTP fetch + trafilatura (fast, no WebView overhead).
+///   2. If the result is < 500 chars, fall back to a silent headless WebView
+///      that renders JavaScript-heavy pages, then re-runs trafilatura.
+///   3. Returns a map with `text`, `title`, `date`, and `extraction_status`.
+///
+/// Extraction status thresholds:
+///   - 'ok'      : 500+ characters of body text
+///   - 'partial' : 200–499 characters
+///   - 'failed'  : < 200 characters
 class ExtractionService {
   Future<Map<String, String>?> extractContent(String url) async {
     try {
-      // --- 1. First Attempt: Plain HTTP Fetch + Trafilatura ---
+      // ── Step 1: Plain HTTP + Trafilatura ──────────────────────────────
       final response = await http.get(
         Uri.parse(url),
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) '
+              'Chrome/120.0.0.0 Safari/537.36',
         },
       );
 
       if (response.statusCode != 200) return null;
 
-      String initialHtml = response.body;
-      Map<String, String>? result = await compute(_processHtmlInIsolate, {'html': initialHtml, 'url': url});
+      Map<String, String>? result = await compute(
+        _processHtmlInIsolate,
+        {'html': response.body, 'url': url},
+      );
 
-      // --- 2. Check if Fallback is needed (text < 500 chars) ---
-      if (result == null || (result['text']?.length ?? 0) < 500) {
-        print("Initial extraction poor (${result?['text']?.length ?? 0} chars). Attempting WebView fallback for $url...");
-        final webViewResult = await _extractWithWebView(url);
-        if (webViewResult != null && (webViewResult['text']?.length ?? 0) > (result?['text']?.length ?? 0)) {
-          result = webViewResult;
-        }
+      // ── Step 2: WebView fallback if text is too short ─────────────────
+      final textLength = result?['text']?.length ?? 0;
+      if (textLength < 500) {
+        result = await _extractWithWebView(url);
       }
 
-      // --- 3. Finalize Status ---
+      // ── Step 3: Assign extraction_status ──────────────────────────────
       if (result != null) {
-        final textLength = result['text']?.length ?? 0;
-        if (textLength < 200) {
-          result['status'] = 'failed';
-        } else if (textLength < 500) {
-          result['status'] = 'partial';
-        } else {
-          result['status'] = 'ok';
-        }
+        result['extraction_status'] = _classifyStatus(textLength);
       }
 
       return result;
     } catch (e) {
-      print("Extraction error for $url: $e");
+      print('Extraction error for $url: $e');
       return null;
     }
   }
 
+  /// Classifies the extraction result based on character count.
+  String _classifyStatus(int length) {
+    if (length < 200) return 'failed';
+    if (length < 500) return 'partial';
+    return 'ok';
+  }
+
+  // ── Silent WebView fallback ─────────────────────────────────────────────
+
+  /// Spins up a headless (completely invisible) WebView, waits for the page
+  /// to fully render (including JS), then extracts the HTML and runs it
+  /// through the same trafilatura pipeline.
   Future<Map<String, String>?> _extractWithWebView(String url) async {
-    Completer<Map<String, String>?> completer = Completer();
+    print('WebView fallback for $url');
+
+    final completer = Completer<Map<String, String>?>();
     HeadlessInAppWebView? headlessWebView;
 
     headlessWebView = HeadlessInAppWebView(
       initialUrlRequest: URLRequest(url: WebUri(url)),
-      onLoadStop: (controller, url) async {
+      onLoadStop: (controller, _) async {
         try {
-          // Wait a bit for JS to settle
+          // Let dynamic content settle.
           await Future.delayed(const Duration(seconds: 2));
-          
-          // Inject JS to get the rendered body
-          final String? renderedHtml = await controller.evaluateJavascript(source: "document.documentElement.outerHTML");
-          
+
+          // Grab the full rendered HTML from the DOM.
+          final renderedHtml = await controller.evaluateJavascript(
+            source: 'document.documentElement.outerHTML;',
+          ) as String?;
+
           if (renderedHtml != null && renderedHtml.isNotEmpty) {
-            // Process rendered HTML in isolate
-            final result = await compute(_processHtmlInIsolate, {'html': renderedHtml, 'url': url.toString()});
+            final result = await compute(
+              _processHtmlInIsolate,
+              {'html': renderedHtml, 'url': url},
+            );
             completer.complete(result);
           } else {
-            completer.complete(null);
+            // HTML extraction failed — try raw body text as last resort.
+            final rawText = await _extractRawBodyText(controller);
+            completer.complete(rawText);
           }
         } catch (e) {
-          print("WebView JS error: $e");
+          print('WebView JS error: $e');
           completer.complete(null);
         } finally {
           headlessWebView?.dispose();
         }
       },
       onReceivedError: (controller, request, error) {
-        print("WebView Load Error: ${error.description}");
+        print('WebView Load Error: ${error.description}');
         completer.complete(null);
         headlessWebView?.dispose();
       },
     );
 
     await headlessWebView.run();
-    
-    return completer.future.timeout(const Duration(seconds: 20), onTimeout: () {
-      print("WebView extraction timed out for $url");
-      headlessWebView?.dispose();
-      return null;
-    });
+
+    return completer.future.timeout(
+      const Duration(seconds: 20),
+      onTimeout: () {
+        print('WebView extraction timed out for $url');
+        headlessWebView?.dispose();
+        return null;
+      },
+    );
+  }
+
+  /// Last-resort: grab document.body.innerText directly via JavaScript.
+  /// The raw text is cleaned and passed through the same deduplication logic
+  /// (but NOT trafilatura, since we already have plain text).
+  Future<Map<String, String>?> _extractRawBodyText(
+    InAppWebViewController controller,
+  ) async {
+    final rawText = await controller.evaluateJavascript(
+      source: 'document.body?.innerText ?? "";',
+    ) as String?;
+
+    if (rawText == null || rawText.trim().isEmpty) return null;
+
+    final lines = rawText.split('\n');
+    final cleaned = _deduplicateAndFilter(lines);
+    final text = cleaned.join('\n\n');
+
+    return {
+      'text': text,
+      'title': '',
+      'date': '',
+      'extraction_status': _classifyStatus(text.length),
+    };
   }
 }
 
-// --- Top-level functions for Isolate processing ---
+// ─── Isolate-safe processing functions ─────────────────────────────────────
 
-Future<Map<String, String>?> _processHtmlInIsolate(Map<String, String> data) async {
+Future<Map<String, String>?> _processHtmlInIsolate(
+  Map<String, String> data,
+) async {
   final String html = data['html']!;
   final String url = data['url']!;
-  
+
   final document = html_parser.parse(html);
   _removeJunkElements(document);
 
+  // Primary: trafilatura extraction (plain text output).
   final trafilaturaText = await trafilatura.extract(
     filecontent: document.outerHtml,
-    outputFormat: 'markdown',
-    includeFormatting: true,
+    outputFormat: 'txt',
+    includeFormatting: false,
     favorPrecision: true,
     includeComments: false,
     includeTables: false,
   );
 
+  // Source-specific fallback.
   String? contentText;
   if (url.contains('indianexpress.com')) {
     contentText = _extractIndianExpress(document);
@@ -121,81 +179,130 @@ Future<Map<String, String>?> _processHtmlInIsolate(Map<String, String> data) asy
   String rawText = trafilaturaText ?? contentText ?? '';
   if (rawText.isEmpty) return null;
 
-  List<String> paragraphs = rawText.split('\n');
-  List<String> cleanedParagraphs = _deduplicateAndFilter(paragraphs);
-  String finalContent = cleanedParagraphs.join('\n\n');
+  // Clean and deduplicate.
+  final paragraphs = rawText.split('\n');
+  final cleanedParagraphs = _deduplicateAndFilter(paragraphs);
+  final finalContent = cleanedParagraphs.join('\n\n');
 
-  // Title extraction
-  String title = '';
-  final metaTitle = document.querySelector('meta[property="og:title"]')?.attributes['content'];
+  // Title extraction.
+  final metaTitle =
+      document.querySelector('meta[property="og:title"]')?.attributes['content'];
   final h1 = document.querySelector('h1')?.text.trim();
   final tagTitle = document.querySelector('title')?.text.trim();
-  title = metaTitle ?? h1 ?? tagTitle ?? '';
+  final title = metaTitle ?? h1 ?? tagTitle ?? '';
 
   return {
     'text': finalContent,
     'title': title,
     'date': '',
-    'status': 'ok',
   };
 }
 
+/// Source-specific extractor for Indian Express articles.
 String? _extractIndianExpress(dom.Document doc) {
-  final storyElement = doc.querySelector('.story-details') ?? doc.querySelector('#story-details') ?? doc.querySelector('.full-details');
+  final storyElement =
+      doc.querySelector('.story-details') ??
+      doc.querySelector('#story-details') ??
+      doc.querySelector('.full-details');
+
   if (storyElement == null) return null;
-  storyElement.querySelectorAll('.also-read, .related-articles, .ie-recommends, .app-exclusive, aside, .newsletter-box').forEach((el) => el.remove());
+
+  storyElement
+      .querySelectorAll(
+        '.also-read, .related-articles, .ie-recommends, '
+        '.app-exclusive, aside, .newsletter-box',
+      )
+      .forEach((el) => el.remove());
+
   return storyElement.text;
 }
 
+/// Strips ads, share buttons, paywalls, and other junk from the DOM before
+/// passing to trafilatura.
 void _removeJunkElements(dom.Document doc) {
   final junkSelectors = [
-    '.app-exclusive', '.ie-recommends', '.related-articles', 
-    '.newsletter-box', '.social-share', '.tags', '.author-bio',
-    'aside', 'script', 'style', '.ad-unit', '.inline-ad',
-    '.read-also', '.also-read', '.trending-stories',
-    '.video-container', '.embed-container', '.custom-ad',
-    '.premium-content-paywall', '#ev-paywall'
+    '.app-exclusive',
+    '.ie-recommends',
+    '.related-articles',
+    '.newsletter-box',
+    '.social-share',
+    '.tags',
+    '.author-bio',
+    'aside',
+    'script',
+    'style',
+    '.ad-unit',
+    '.inline-ad',
+    '.read-also',
+    '.also-read',
+    '.trending-stories',
+    '.video-container',
+    '.embed-container',
+    '.custom-ad',
+    '.premium-content-paywall',
+    '#ev-paywall',
   ];
-  for (var selector in junkSelectors) {
+
+  for (final selector in junkSelectors) {
     doc.querySelectorAll(selector).forEach((el) => el.remove());
   }
 }
 
+/// Removes empty lines, boilerplate phrases, and exact duplicates.
+/// Less aggressive than before — containment matching is removed so
+/// short valid sentences are not absorbed by longer paragraphs.
 List<String> _deduplicateAndFilter(List<String> paragraphs) {
-  Set<String> seenNormal = {};
-  List<String> unique = [];
-  for (var p in paragraphs) {
-    String trimmed = p.trim();
+  final seenExact = <String>{};
+  final unique = <String>[];
+
+  for (final p in paragraphs) {
+    final trimmed = p.trim();
     if (trimmed.isEmpty) continue;
-    String normalized = trimmed.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+    final normalized =
+        trimmed.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+
     if (_isBoilerplate(trimmed.toLowerCase())) continue;
-    if (normalized.length < 15 && !trimmed.startsWith('#')) continue;
-    bool isDuplicate = false;
-    for (var existing in seenNormal) {
-      if (existing.contains(normalized) || normalized.contains(existing)) {
-        isDuplicate = true;
-        break;
-      }
-    }
-    if (!isDuplicate) {
+    if (normalized.length < 10 && !trimmed.startsWith('#')) continue;
+
+    // Only skip exact duplicates
+    if (!seenExact.contains(normalized)) {
       unique.add(trimmed);
-      seenNormal.add(normalized);
+      seenExact.add(normalized);
     }
   }
+
   return unique;
 }
 
+/// Detects common boilerplate phrases that shouldn't appear in article text.
 bool _isBoilerplate(String text) {
   final junkPhrases = [
-    'see all', 'remove', 'advertisement', 'newsletter', 'must read',
-    'click here', 'follow us on', 'subscribe to', 'read more', 
-    'also read', 'related stories', 'trending now', 'join our telegram',
-    'copyright', 'all rights reserved', 'written by', 'edited by',
-    'explained desk', 'express news service'
+    'see all',
+    'remove',
+    'advertisement',
+    'newsletter',
+    'must read',
+    'click here',
+    'follow us on',
+    'subscribe to',
+    'read more',
+    'also read',
+    'related stories',
+    'trending now',
+    'join our telegram',
+    'copyright',
+    'all rights reserved',
+    'written by',
+    'edited by',
+    'explained desk',
+    'express news service',
   ];
-  for (var phrase in junkPhrases) {
+
+  for (final phrase in junkPhrases) {
     if (text.contains(phrase)) return true;
   }
+
   if (RegExp(r'\d+ min read').hasMatch(text)) return true;
   return false;
 }
